@@ -1,0 +1,216 @@
+name: Upstream watch
+
+# Daily sweep: queries the Go module proxy for the latest tags of the
+# three core deps (mihomo, sing-box, xray-core). If any have moved
+# beyond what's pinned in go/go.mod, bump them, rebuild the DLLs, tag
+# a v<YYYY.MM.DD> release, and publish per-arch zips as GitHub
+# Release assets. Multiple bumps on the same day are batched into one
+# release. Same-day re-runs (manual force) append .1, .2… to the tag.
+
+on:
+  schedule:
+    - cron: '0 8 * * *'  # 08:00 UTC daily
+  workflow_dispatch:
+    inputs:
+      force_release:
+        description: "Cut a release even if no upstream change is detected"
+        type: boolean
+        default: false
+
+concurrency:
+  group: upstream-watch
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  watch-and-release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go/go.mod
+          cache: true
+          cache-dependency-path: go/go.sum
+
+      - name: Install Windows cross toolchains
+        run: |
+          set -euo pipefail
+          # amd64: distro mingw-w64. arm64: llvm-mingw release tarball
+          # (mingw-w64 gcc has no aarch64-windows target).
+          sudo apt-get update -q
+          sudo apt-get install -qy gcc-mingw-w64-x86-64
+          LLVM_MINGW=llvm-mingw-20250910-ucrt-ubuntu-22.04-x86_64
+          curl -sSfL -o /tmp/llvm-mingw.tar.xz \
+            "https://github.com/mstorsjo/llvm-mingw/releases/download/20250910/${LLVM_MINGW}.tar.xz"
+          tar -C /opt -xf /tmp/llvm-mingw.tar.xz
+          echo "/opt/${LLVM_MINGW}/bin" >> "$GITHUB_PATH"
+
+      - name: Detect upstream versions
+        id: versions
+        working-directory: go
+        run: |
+          set -euo pipefail
+
+          # The Go proxy's /@latest endpoint is defined to return the
+          # newest *stable* tag (no pre-releases) for a module. We
+          # query it directly rather than `go list -m -versions`, which
+          # would happily include `v1.14.0-alpha.23` in its output.
+          # For xray-core this returns the Go-module-compatible
+          # v1.YYMMDD.0 tag, not the human v26.x.x.
+          latest() {
+            curl -sSf "https://proxy.golang.org/$1/@latest" | jq -r '.Version'
+          }
+
+          # Current pin = the version go.mod's require block resolves to.
+          current() { go list -m -f '{{.Version}}' "$1"; }
+
+          mihomo_latest=$(latest github.com/metacubex/mihomo)
+          singbox_latest=$(latest github.com/sagernet/sing-box)
+          xray_latest=$(latest github.com/xtls/xray-core)
+
+          mihomo_current=$(current github.com/metacubex/mihomo)
+          singbox_current=$(current github.com/sagernet/sing-box)
+          xray_current=$(current github.com/xtls/xray-core)
+
+          {
+            echo "### Upstream pin check"
+            echo
+            echo "| module | current | latest | bump? |"
+            echo "|---|---|---|---|"
+            for trio in \
+              "mihomo|$mihomo_current|$mihomo_latest" \
+              "sing-box|$singbox_current|$singbox_latest" \
+              "xray-core|$xray_current|$xray_latest"; do
+              IFS='|' read -r name cur lat <<<"$trio"
+              [[ "$cur" == "$lat" ]] && marker="—" || marker="✓"
+              echo "| $name | $cur | $lat | $marker |"
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          changed=false
+          [[ "$mihomo_current"  != "$mihomo_latest"  ]] && changed=true
+          [[ "$singbox_current" != "$singbox_latest" ]] && changed=true
+          [[ "$xray_current"    != "$xray_latest"    ]] && changed=true
+
+          {
+            echo "mihomo_latest=$mihomo_latest"
+            echo "singbox_latest=$singbox_latest"
+            echo "xray_latest=$xray_latest"
+            echo "mihomo_current=$mihomo_current"
+            echo "singbox_current=$singbox_current"
+            echo "xray_current=$xray_current"
+            echo "changed=$changed"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Decide whether to proceed
+        id: proceed
+        run: |
+          if [[ "${{ steps.versions.outputs.changed }}" == "true" \
+             || "${{ inputs.force_release }}" == "true" ]]; then
+            echo "go=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "go=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::No upstream changes; skipping release."
+          fi
+
+      - name: Bump go.mod
+        if: steps.proceed.outputs.go == 'true'
+        working-directory: go
+        run: |
+          set -euo pipefail
+          go get github.com/metacubex/mihomo@${{ steps.versions.outputs.mihomo_latest }}
+          go get github.com/sagernet/sing-box@${{ steps.versions.outputs.singbox_latest }}
+          go get github.com/xtls/xray-core@${{ steps.versions.outputs.xray_latest }}
+          go mod tidy
+
+      - name: Build DLLs
+        if: steps.proceed.outputs.go == 'true'
+        run: Scripts/build.sh
+
+      - name: Compute release tag
+        if: steps.proceed.outputs.go == 'true'
+        id: tag
+        run: |
+          set -euo pipefail
+          base="v$(date -u +%Y.%m.%d)"
+          tag="$base"
+          n=1
+          # Already taken? Append .1, .2, … (manual force on the same day).
+          while git rev-parse --verify --quiet "refs/tags/$tag" >/dev/null; do
+            n=$((n+1))
+            tag="$base.$n"
+          done
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - name: Zip + checksum
+        if: steps.proceed.outputs.go == 'true'
+        id: artifact
+        run: |
+          set -euo pipefail
+          assets=()
+          for arch in amd64 arm64; do
+            [[ -d "dist/windows-$arch" ]] || continue
+            zip_name="EverywhereCore-${{ steps.tag.outputs.tag }}-windows-$arch.zip"
+            (cd "dist/windows-$arch" && zip -q "../../$zip_name" EverywhereCore.dll EverywhereCore.h)
+            sha256sum "$zip_name" > "$zip_name.sha256"
+            assets+=("$zip_name" "$zip_name.sha256")
+          done
+          echo "assets=${assets[*]}" >> "$GITHUB_OUTPUT"
+
+      - name: Commit + tag + push
+        if: steps.proceed.outputs.go == 'true'
+        run: |
+          set -euo pipefail
+
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add go/go.mod go/go.sum
+          git commit -m "release ${{ steps.tag.outputs.tag }}
+
+          mihomo:    ${{ steps.versions.outputs.mihomo_current }} → ${{ steps.versions.outputs.mihomo_latest }}
+          sing-box:  ${{ steps.versions.outputs.singbox_current }} → ${{ steps.versions.outputs.singbox_latest }}
+          xray-core: ${{ steps.versions.outputs.xray_current }} → ${{ steps.versions.outputs.xray_latest }}"
+
+          git tag -a "${{ steps.tag.outputs.tag }}" -m "${{ steps.tag.outputs.tag }}"
+
+          # Tag + main in a single push. HEAD is detached at the
+          # checked-out SHA; HEAD:main pushes it to the main branch.
+          git push origin "HEAD:${{ github.event.repository.default_branch }}" "${{ steps.tag.outputs.tag }}"
+
+      - name: Create GitHub Release
+        if: steps.proceed.outputs.go == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          notes=$(cat <<EOF
+          ### Upstream bumps
+
+          - **mihomo:**    \`${{ steps.versions.outputs.mihomo_current }}\` → \`${{ steps.versions.outputs.mihomo_latest }}\`
+          - **sing-box:**  \`${{ steps.versions.outputs.singbox_current }}\` → \`${{ steps.versions.outputs.singbox_latest }}\`
+          - **xray-core:** \`${{ steps.versions.outputs.xray_current }}\` → \`${{ steps.versions.outputs.xray_latest }}\`
+
+          ### Consume
+
+          Unzip next to the Everywhere service executable. Offering the
+          Xray core additionally requires wintun.dll from wintun.net —
+          see PATCHES.md.
+          EOF
+          )
+          gh release create "${{ steps.tag.outputs.tag }}" \
+            ${{ steps.artifact.outputs.assets }} \
+            --title "${{ steps.tag.outputs.tag }}" \
+            --notes "$notes"
