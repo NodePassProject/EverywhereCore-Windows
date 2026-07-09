@@ -69,7 +69,11 @@ apply_varz_patch() {
     if [[ ! -f "$dest/tsweb/varz/varz.go" ]]; then
         rm -rf "$dest"
         mkdir -p "$dest"
-        cp -R "$src/" "$dest/"
+        # "$src/." (not "$src/"): GNU cp copies a trailing-slash source
+        # as a subdirectory (dest/<basename>/…), BSD cp copies its
+        # contents. The "/." form copies contents on both, so the CI
+        # runner (Linux/GNU) and local macOS agree on dest/tsweb/….
+        cp -R "$src/." "$dest/"
         chmod -R u+w "$dest"
         sed -i.bak \
             -e "s/expvar\.Publish(\"process_start_unix_time\"/expvar.Publish(\"${prefix}_process_start_unix_time\"/" \
