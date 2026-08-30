@@ -5,7 +5,7 @@ go 1.26
 require (
 	github.com/metacubex/mihomo v1.19.30
 	github.com/sagernet/sing v0.8.14
-	github.com/sagernet/sing-box v1.13.20
+	github.com/sagernet/sing-box v1.13.21
 	github.com/xtls/xray-core v1.260327.0
 )
 
@@ -186,7 +186,7 @@ require (
 	github.com/sagernet/sing-shadowsocks v0.2.8 // indirect
 	github.com/sagernet/sing-shadowsocks2 v0.2.1 // indirect
 	github.com/sagernet/sing-shadowtls v0.2.1 // indirect
-	github.com/sagernet/sing-tun v0.8.14 // indirect
+	github.com/sagernet/sing-tun v0.8.15 // indirect
 	github.com/sagernet/sing-vmess v0.2.8-0.20250909125414-3aed155119a1 // indirect
 	github.com/sagernet/smux v1.5.50-sing-box-mod.1 // indirect
 	github.com/sagernet/tailscale v1.92.4-sing-box-1.13-mod.10 // indirect
